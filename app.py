@@ -11,8 +11,8 @@ NHL_SEARCH = "https://search.d3.nhle.com/api/v1/search/player"
 app = Flask(__name__)
 
 
-def _get_json(url, params=None):
-    response = requests.get(url, params=params, timeout=20)
+def _get_json(url, params=None, timeout=20):
+    response = requests.get(url, params=params, timeout=timeout)
     response.raise_for_status()
     return response.json()
 
@@ -78,6 +78,10 @@ def _game_log(player_id, season=None, game_type=2):
     return _get_json(f"{NHL_WEB}/player/{player_id}/game-log/now")
 
 
+def _play_by_play(game_id):
+    return _get_json(f"{NHL_WEB}/gamecenter/{game_id}/play-by-play", timeout=10)
+
+
 def _extract_games(data):
     if isinstance(data, list):
         return data
@@ -87,16 +91,94 @@ def _extract_games(data):
     return []
 
 
-def _format_game(game):
+def _event_type(play):
+    return str(
+        _first(play, ["typeDescKey", "eventTypeDescKey", "type", "eventType"], "")
+    ).lower()
+
+
+def _is_shootout(play):
+    period = play.get("periodDescriptor") if isinstance(play, dict) else {}
+    return str(_first(period or {}, ["periodType", "periodTypeCode"], "")).upper() == "SO"
+
+
+def _count_player_attempts(player_id, game_id):
+    if not game_id:
+        return {
+            "shotAttempts": None,
+            "savedShotsOnGoal": None,
+            "goalsFromAttempts": None,
+            "missedShots": None,
+            "blockedShotAttempts": None,
+            "attemptsAvailable": False,
+            "attemptsSource": None,
+        }
+
+    try:
+        data = _play_by_play(game_id)
+    except requests.RequestException:
+        return {
+            "shotAttempts": None,
+            "savedShotsOnGoal": None,
+            "goalsFromAttempts": None,
+            "missedShots": None,
+            "blockedShotAttempts": None,
+            "attemptsAvailable": False,
+            "attemptsSource": "NHL api-web gamecenter play-by-play unavailable",
+        }
+
+    counts = {
+        "savedShotsOnGoal": 0,
+        "goalsFromAttempts": 0,
+        "missedShots": 0,
+        "blockedShotAttempts": 0,
+    }
+
+    for play in data.get("plays", []):
+        if not isinstance(play, dict) or _is_shootout(play):
+            continue
+
+        play_type = _event_type(play)
+        if play_type not in {"goal", "shot-on-goal", "missed-shot", "blocked-shot"}:
+            continue
+
+        details = play.get("details") or {}
+        shooter_id = _num(
+            _first(details, ["shootingPlayerId", "scoringPlayerId", "shooterPlayerId"]),
+            None,
+        )
+        if shooter_id != player_id:
+            continue
+
+        if play_type == "goal":
+            counts["goalsFromAttempts"] += 1
+        elif play_type == "shot-on-goal":
+            counts["savedShotsOnGoal"] += 1
+        elif play_type == "missed-shot":
+            counts["missedShots"] += 1
+        elif play_type == "blocked-shot":
+            counts["blockedShotAttempts"] += 1
+
+    shot_attempts = sum(counts.values())
+    return {
+        "shotAttempts": shot_attempts,
+        **counts,
+        "attemptsAvailable": True,
+        "attemptsSource": "NHL api-web gamecenter play-by-play",
+    }
+
+
+def _format_game(game, player_id=None, include_attempts=True):
     opponent = _first(game, ["opponentAbbrev", "opponent", "opponentTeamAbbrev", "oppAbbrev"])
     home_road = _first(game, ["homeRoadFlag", "homeRoad", "homeOrAway"])
     shots = _num(_first(game, ["shots", "shotsOnGoal", "sog", "shotsOnNet"]))
     toi = _first(game, ["toi", "timeOnIce", "timeOnIcePerGame"])
     pp_toi = _first(game, ["powerPlayToi", "ppToi", "powerPlayTimeOnIce"])
+    game_id = _num(_first(game, ["gameId", "gamePk", "id"]), None)
 
-    return {
+    formatted = {
         "date": _first(game, ["gameDate", "date"]),
-        "gameId": _num(_first(game, ["gameId", "gamePk", "id"]), None),
+        "gameId": game_id,
         "opponent": opponent,
         "homeRoad": home_road,
         "shotsOnGoal": shots,
@@ -107,6 +189,9 @@ def _format_game(game):
         "powerPlayToi": pp_toi,
         "source": "NHL api-web player game log",
     }
+    if include_attempts and player_id:
+        formatted.update(_count_player_attempts(player_id, game_id))
+    return formatted
 
 
 def _summary(games, line):
@@ -132,10 +217,16 @@ def _summary(games, line):
     return {
         "last5": {
             "averageShotsOnGoal": average(last5, "shotsOnGoal"),
+            "averageShotAttempts": average(last5, "shotAttempts"),
+            "averageMissedShots": average(last5, "missedShots"),
+            "averageBlockedShotAttempts": average(last5, "blockedShotAttempts"),
             "hitRateVsLine": hit_rate(last5),
         },
         "last10": {
             "averageShotsOnGoal": average(last10, "shotsOnGoal"),
+            "averageShotAttempts": average(last10, "shotAttempts"),
+            "averageMissedShots": average(last10, "missedShots"),
+            "averageBlockedShotAttempts": average(last10, "blockedShotAttempts"),
             "hitRateVsLine": hit_rate(last10),
         },
     }
@@ -154,6 +245,11 @@ def player_sog_log():
     limit = min(max(_num(request.args.get("limit"), 10), 1), 15)
     line_raw = request.args.get("line")
     line = float(line_raw) if line_raw not in (None, "") else None
+    include_attempts = str(request.args.get("include_attempts", "true")).lower() not in {
+        "0",
+        "false",
+        "no",
+    }
 
     if not player_name:
         return jsonify({"error": "player_name is required"}), 400
@@ -164,8 +260,15 @@ def player_sog_log():
 
     player_id = _player_id(player)
     raw_log = _game_log(player_id, season, game_type)
-    games = [_format_game(game) for game in _extract_games(raw_log)]
-    games = sorted(games, key=lambda item: item.get("date") or "", reverse=True)[:limit]
+    raw_games = sorted(
+        _extract_games(raw_log),
+        key=lambda item: _first(item, ["gameDate", "date"]) or "",
+        reverse=True,
+    )[:limit]
+    games = [
+        _format_game(game, player_id=player_id, include_attempts=include_attempts)
+        for game in raw_games
+    ]
 
     return jsonify(
         {
@@ -184,6 +287,8 @@ def player_sog_log():
             "notes": [
                 "Hit rate uses shots on goal greater than the supplied line, matching an Over prop.",
                 "TOI and power-play TOI are included when available from the NHL game-log endpoint.",
+                "Shot attempts are counted from NHL play-by-play as goals plus saved shots on goal plus missed shots plus blocked shot attempts.",
+                "Shootout attempts are excluded because they do not count toward player prop results.",
             ],
         }
     )
@@ -192,4 +297,3 @@ def player_sog_log():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8000"))
     app.run(host="0.0.0.0", port=port)
-
