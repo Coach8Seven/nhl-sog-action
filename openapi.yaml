@@ -1,0 +1,75 @@
+openapi: 3.1.0
+info:
+  title: NHL Shots On Goal Helper
+  description: Returns recent NHL player game logs with shots on goal and hit rates for SOG prop research.
+  version: 1.0.0
+servers:
+  - url: https://YOUR-DEPLOYED-DOMAIN.example.com
+paths:
+  /player-sog-log:
+    get:
+      operationId: getPlayerSogLog
+      summary: Get recent NHL shots on goal game log.
+      description: Use this action when the GPT needs reliable last 5 and last 10 shots on goal, hit rates, opponent, and time-on-ice fields when available.
+      parameters:
+        - name: player_name
+          in: query
+          required: true
+          description: Full or common name of the NHL skater, such as Connor McDavid.
+          schema:
+            type: string
+        - name: season
+          in: query
+          required: false
+          description: NHL season. Use an 8-digit season like 20252026 or a start year like 2025. Omit for current season.
+          schema:
+            type: string
+        - name: game_type
+          in: query
+          required: false
+          description: NHL game type. Use 2 for regular season and 3 for playoffs.
+          schema:
+            type: integer
+            default: 2
+        - name: limit
+          in: query
+          required: false
+          description: Number of recent games to return. Use 10 by default.
+          schema:
+            type: integer
+            default: 10
+            minimum: 1
+            maximum: 15
+        - name: line
+          in: query
+          required: false
+          description: Shots on goal prop line, such as 3.5. Used to calculate last 5 and last 10 hit rate for an Over.
+          schema:
+            type: number
+      responses:
+        "200":
+          description: Recent player SOG game log and summary statistics.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  player:
+                    type: object
+                  season:
+                    type: string
+                  games:
+                    type: array
+                    items:
+                      type: object
+                  summary:
+                    type: object
+                  notes:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          description: Missing required player_name.
+        "404":
+          description: Player not found.
+
